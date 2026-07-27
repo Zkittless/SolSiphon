@@ -37,7 +37,7 @@ class Giveaway(commands.Cog):
     # ---------- Code generation (mod/streamer only) ----------
 
     @app_commands.command(
-        name="giveaway-create",
+        name="code-create",
         description="Generate a redeemable giveaway code for a fixed USD amount.",
     )
     @app_commands.describe(
