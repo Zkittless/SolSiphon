@@ -22,6 +22,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (id: {bot.user.id})")
+
+    # Re-attach persistent views for any giveaways still open from before a
+    # restart -- otherwise the Enter button on old messages stops responding.
+    from bot.cogs.giveaways import EnterButton
+    from db.pool import get_pool
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        open_giveaways = await conn.fetch("SELECT id FROM giveaways WHERE status = 'open'")
+    for row in open_giveaways:
+        bot.add_view(EnterButton(row["id"]))
+    if open_giveaways:
+        logger.info(f"Re-registered {len(open_giveaways)} open giveaway button(s)")
+
     guild_id = os.environ.get("DISCORD_GUILD_ID")
     if guild_id:
         guild = discord.Object(id=int(guild_id))
@@ -37,6 +51,7 @@ async def main():
     await init_pool()
     async with bot:
         await bot.load_extension("bot.cogs.giveaway")
+        await bot.load_extension("bot.cogs.giveaways")
         await bot.start(os.environ["DISCORD_BOT_TOKEN"])
 
 
