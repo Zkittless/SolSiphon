@@ -46,7 +46,7 @@ def is_mod():
     return app_commands.check(predicate)
 
 
-def _giveaway_embed(amount_usd: float, ends_at: datetime, entrant_count: int, status: str = "open") -> discord.Embed:
+def _giveaway_embed(giveaway_id: int, amount_usd: float, ends_at: datetime, entrant_count: int, status: str = "open") -> discord.Embed:
     if status == "open":
         embed = discord.Embed(
             title="🎉 Giveaway!",
@@ -63,7 +63,7 @@ def _giveaway_embed(amount_usd: float, ends_at: datetime, entrant_count: int, st
             description=f"**Prize:** ${amount_usd:.2f}\n\nWinner has been notified by DM.",
             color=discord.Color.dark_grey(),
         )
-    embed.set_footer(text=f"{entrant_count} entrant(s)")
+    embed.set_footer(text=f"Giveaway #{giveaway_id} • {entrant_count} entrant(s)")
     return embed
 
 
@@ -82,7 +82,7 @@ class GiveawayView(discord.ui.View):
         async with pool.acquire() as conn:
             async with conn.transaction():
                 giveaway = await conn.fetchrow(
-                    "SELECT status FROM giveaways WHERE id = $1 FOR UPDATE",
+                    "SELECT status, amount_usd, ends_at FROM giveaways WHERE id = $1 FOR UPDATE",
                     self.giveaway_id,
                 )
                 if giveaway is None:
@@ -120,7 +120,27 @@ class GiveawayView(discord.ui.View):
                     actor=str(interaction.user.id),
                 )
 
+                entrant_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM giveaway_entrants WHERE giveaway_id = $1",
+                    self.giveaway_id,
+                )
+
         await interaction.response.send_message("You're entered! Good luck 🎉", ephemeral=True)
+
+        # Live-update the entrant count on the original embed. Best-effort --
+        # if the message was deleted or edit fails, the entry itself is
+        # already recorded, so don't fail the interaction over a cosmetic edit.
+        try:
+            updated_embed = _giveaway_embed(
+                self.giveaway_id,
+                float(giveaway["amount_usd"]),
+                giveaway["ends_at"],
+                entrant_count,
+                status="open",
+            )
+            await interaction.message.edit(embed=updated_embed, view=self)
+        except Exception:
+            pass
 
     @discord.ui.button(label="View Joiners", style=discord.ButtonStyle.grey, emoji="👥")
     async def view_joiners_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -232,7 +252,7 @@ class Giveaways(commands.Cog):
                     metadata={"amount_usd": amount_usd, "ends_at": ends_at.isoformat()},
                 )
 
-        embed = _giveaway_embed(amount_usd, ends_at, entrant_count=0)
+        embed = _giveaway_embed(giveaway_id, amount_usd, ends_at, entrant_count=0)
         view = GiveawayView(giveaway_id)
 
         await interaction.response.send_message(embed=embed, view=view)
@@ -358,7 +378,7 @@ class Giveaways(commands.Cog):
             if giveaway["message_id"]:
                 message = await channel.fetch_message(int(giveaway["message_id"]))
                 embed = _giveaway_embed(
-                    float(giveaway["amount_usd"]), giveaway["ends_at"],
+                    giveaway_id, float(giveaway["amount_usd"]), giveaway["ends_at"],
                     len(entrants), status="ended",
                 )
                 await message.edit(embed=embed, view=None)
