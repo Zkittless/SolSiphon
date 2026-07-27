@@ -2,13 +2,13 @@
 Timed giveaways with button entry.
 
 Flow:
-  /giveaway-start amount_usd duration_minutes
-    -> posts an embed with an "Enter" button in the channel
-    -> users click to enter (one entry per user, enforced at the DB level)
+  /giveaway-create amount_usd [duration_hours] [duration_minutes]
+    -> posts an embed with "Enter" and "View Joiners" buttons in the channel
+    -> users click Enter to join (one entry per user, enforced at the DB level)
     -> a background loop checks every 30s for giveaways past their end time
        and ends them automatically; /giveaway-end lets a mod end one early
     -> ending picks a random entrant, creates a giveaway_codes row for them
-       (same table /giveaway-create uses), and DMs them the code
+       (same table /code-create uses), and DMs them the code
 
 Winners still redeem through the normal /redeem command -- this cog only
 handles entry + selection + code generation + DM delivery. No wallet code
@@ -19,6 +19,7 @@ import os
 import random
 from datetime import datetime, timedelta, timezone
 
+import asyncpg
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -27,6 +28,14 @@ from bot.codegen import generate_code
 from db.pool import get_pool, write_audit
 
 MOD_ROLE_ID = int(os.environ.get("MOD_ROLE_ID", 0))
+
+HOUR_CHOICES = [
+    app_commands.Choice(name="2 hours", value=2),
+    app_commands.Choice(name="4 hours", value=4),
+    app_commands.Choice(name="8 hours", value=8),
+    app_commands.Choice(name="12 hours", value=12),
+    app_commands.Choice(name="24 hours", value=24),
+]
 
 
 def is_mod():
@@ -58,14 +67,14 @@ def _giveaway_embed(amount_usd: float, ends_at: datetime, entrant_count: int, st
     return embed
 
 
-class EnterButton(discord.ui.View):
-    """Persistent view -- custom_id encodes the giveaway ID so it survives restarts."""
+class GiveawayView(discord.ui.View):
+    """Persistent view -- custom_ids encode the giveaway ID so it survives restarts."""
 
     def __init__(self, giveaway_id: int):
         super().__init__(timeout=None)
         self.giveaway_id = giveaway_id
-        # Rebuild the button with a stable custom_id per giveaway.
         self.enter_button.custom_id = f"giveaway_enter:{giveaway_id}"
+        self.view_joiners_button.custom_id = f"giveaway_joiners:{giveaway_id}"
 
     @discord.ui.button(label="Enter", style=discord.ButtonStyle.green, emoji="🎉")
     async def enter_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -96,14 +105,12 @@ class EnterButton(discord.ui.View):
                         self.giveaway_id,
                         str(interaction.user.id),
                     )
-                except Exception as e:
-                    # Unique violation -- already entered.
-                    if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-                        await interaction.response.send_message(
-                            "You're already entered in this giveaway.", ephemeral=True
-                        )
-                        return
-                    raise
+                except asyncpg.UniqueViolationError:
+                    # Real duplicate entry for THIS giveaway_id specifically.
+                    await interaction.response.send_message(
+                        "You're already entered in this giveaway.", ephemeral=True
+                    )
+                    return
 
                 await write_audit(
                     conn,
@@ -114,6 +121,40 @@ class EnterButton(discord.ui.View):
                 )
 
         await interaction.response.send_message("You're entered! Good luck 🎉", ephemeral=True)
+
+    @discord.ui.button(label="View Joiners", style=discord.ButtonStyle.grey, emoji="👥")
+    async def view_joiners_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            entrants = await conn.fetch(
+                """
+                SELECT discord_user_id FROM giveaway_entrants
+                WHERE giveaway_id = $1
+                ORDER BY entered_at ASC
+                """,
+                self.giveaway_id,
+            )
+
+        if not entrants:
+            await interaction.response.send_message(
+                "No one has entered yet.", ephemeral=True
+            )
+            return
+
+        # Discord message limits mean a very large entrant list needs
+        # truncating -- show the first 50 and a count of the rest.
+        shown = entrants[:50]
+        mentions = "\n".join(f"{i+1}. <@{row['discord_user_id']}>" for i, row in enumerate(shown))
+        extra = len(entrants) - len(shown)
+        if extra > 0:
+            mentions += f"\n...and {extra} more"
+
+        embed = discord.Embed(
+            title=f"Entrants ({len(entrants)})",
+            description=mentions,
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class Giveaways(commands.Cog):
@@ -132,27 +173,40 @@ class Giveaways(commands.Cog):
     )
     @app_commands.describe(
         amount_usd="Dollar amount the winner receives",
-        duration_minutes="How long entries stay open, in minutes",
+        duration_hours="How long entries stay open (pick a preset)",
+        duration_minutes="Custom duration in minutes -- overrides duration_hours if set",
     )
+    @app_commands.choices(duration_hours=HOUR_CHOICES)
     @is_mod()
-    async def giveaway_start(
+    async def giveaway_create(
         self,
         interaction: discord.Interaction,
         amount_usd: float,
-        duration_minutes: int,
+        duration_hours: app_commands.Choice[int] | None = None,
+        duration_minutes: int | None = None,
     ):
         if amount_usd <= 0:
             await interaction.response.send_message(
                 "Amount must be greater than 0.", ephemeral=True
             )
             return
-        if duration_minutes <= 0:
+
+        if duration_minutes is not None:
+            if duration_minutes <= 0:
+                await interaction.response.send_message(
+                    "Custom duration must be greater than 0 minutes.", ephemeral=True
+                )
+                return
+            total_minutes = duration_minutes
+        elif duration_hours is not None:
+            total_minutes = duration_hours.value * 60
+        else:
             await interaction.response.send_message(
-                "Duration must be greater than 0 minutes.", ephemeral=True
+                "Pick a duration_hours preset or specify duration_minutes.", ephemeral=True
             )
             return
 
-        ends_at = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+        ends_at = datetime.now(timezone.utc) + timedelta(minutes=total_minutes)
 
         pool = get_pool()
         async with pool.acquire() as conn:
@@ -179,7 +233,7 @@ class Giveaways(commands.Cog):
                 )
 
         embed = _giveaway_embed(amount_usd, ends_at, entrant_count=0)
-        view = EnterButton(giveaway_id)
+        view = GiveawayView(giveaway_id)
 
         await interaction.response.send_message(embed=embed, view=view)
         sent_message = await interaction.original_response()
