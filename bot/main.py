@@ -3,9 +3,11 @@ import logging
 import os
 
 import discord
+from aiohttp import web
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from bot.kick.webhook_server import create_app
 from db.pool import init_pool
 
 load_dotenv()
@@ -47,12 +49,34 @@ async def on_ready():
         logger.info(f"Synced {len(synced)} global commands")
 
 
+async def run_webhook_server():
+    """
+    Runs the Kick webhook HTTP server on Railway's assigned PORT, in the
+    same process as the Discord bot. Railway only exposes one public
+    port per service -- this is why the webhook server isn't a separate
+    Railway service, it just shares this one.
+    """
+    port = int(os.environ.get("PORT", 8080))
+    app = create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Kick webhook server listening on :{port}")
+    # Keep this coroutine alive alongside the bot for the process lifetime.
+    await asyncio.Event().wait()
+
+
 async def main():
     await init_pool()
     async with bot:
         await bot.load_extension("bot.cogs.giveaway")
         await bot.load_extension("bot.cogs.giveaways")
-        await bot.start(os.environ["DISCORD_BOT_TOKEN"])
+        await bot.load_extension("bot.cogs.kick_rewards")
+        await asyncio.gather(
+            bot.start(os.environ["DISCORD_BOT_TOKEN"]),
+            run_webhook_server(),
+        )
 
 
 if __name__ == "__main__":
